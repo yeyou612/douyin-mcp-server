@@ -24,6 +24,7 @@ from http import HTTPStatus
 import dashscope
 from groq import Groq
 import inspect
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
 from fastapi import FastAPI, Header
 import uvicorn
@@ -46,6 +47,14 @@ HEADERS = {
 STT_PROVIDER = os.getenv('STT_PROVIDER', 'dashscope')
 DEFAULT_GROQ_MODEL = os.getenv('GROQ_STT_MODEL', 'whisper-large-v3-turbo')
 DEFAULT_DASHSCOPE_MODEL = os.getenv('DASHSCOPE_STT_MODEL', 'paraformer-v2')
+AUDIO_BITRATE = os.getenv('AUDIO_BITRATE', '128k')
+AUDIO_BITRATE_FALLBACK = os.getenv('AUDIO_BITRATE_FALLBACK', '64k')
+GROQ_MAX_AUDIO_MB = int(os.getenv('GROQ_MAX_AUDIO_MB', '24'))
+GROQ_USE_STREAM_TRANSCODE = os.getenv('GROQ_USE_STREAM_TRANSCODE', '').lower() in ['1', 'true', 'yes']
+AUDIO_SAMPLE_RATE = os.getenv('AUDIO_SAMPLE_RATE', '16000')
+AUDIO_CHANNELS = int(os.getenv('AUDIO_CHANNELS', '1'))
+GROQ_STREAM_DURATION_SEC = int(os.getenv('GROQ_STREAM_DURATION_SEC', '60'))
+VIDEO_RATIO = os.getenv('VIDEO_RATIO', '')
 
 def require_auth(func):
     expected = os.getenv('MCP_AUTH_TOKEN')
@@ -175,6 +184,29 @@ class DouyinProcessor:
             "title": desc,
             "video_id": video_id
         }
+    # 调整清晰度
+    def _apply_ratio(self, url: str) -> str:
+        """调整播放链接清晰度
+        
+        参数说明:
+        - url: 视频播放地址
+        
+        返回值说明:
+        - str: 替换 ratio 参数后的播放地址
+        
+        异常说明:
+        - 无
+        """
+        if not VIDEO_RATIO:
+            return url
+        try:
+            p = urlparse(url)
+            q = parse_qs(p.query)
+            q['ratio'] = [VIDEO_RATIO]
+            new_q = urlencode(q, doseq=True)
+            return urlunparse((p.scheme, p.netloc, p.path, p.params, new_q, p.fragment))
+        except Exception:
+            return url
     
     async def download_video(self, video_info: dict, ctx: Context) -> Path:
         """异步下载视频到临时目录"""
@@ -183,7 +215,8 @@ class DouyinProcessor:
         
         ctx.info(f"正在下载视频: {video_info['title']}")
         
-        response = requests.get(video_info['url'], headers=HEADERS, stream=True)
+        url = self._apply_ratio(video_info['url'])
+        response = requests.get(url, headers=HEADERS, stream=True)
         response.raise_for_status()
         
         # 获取文件大小
@@ -211,10 +244,65 @@ class DouyinProcessor:
             (
                 ffmpeg
                 .input(str(video_path))
-                .output(str(audio_path), acodec='libmp3lame', q=0)
+                .output(str(audio_path), acodec='libmp3lame', audio_bitrate=AUDIO_BITRATE, ar=AUDIO_SAMPLE_RATE, ac=AUDIO_CHANNELS)
                 .run(capture_stdout=True, capture_stderr=True, overwrite_output=True)
             )
+            # 大文件回退转码
+            size_mb = audio_path.stat().st_size / (1024 * 1024)
+            if size_mb > GROQ_MAX_AUDIO_MB and AUDIO_BITRATE_FALLBACK:
+                fallback_path = video_path.with_suffix('.fallback.mp3')
+                (
+                    ffmpeg
+                    .input(str(video_path))
+                    .output(str(fallback_path), acodec='libmp3lame', audio_bitrate=AUDIO_BITRATE_FALLBACK)
+                    .run(capture_stdout=True, capture_stderr=True, overwrite_output=True)
+                )
+                try:
+                    audio_path.unlink()
+                except Exception:
+                    pass
+                fallback_path.rename(audio_path)
             return audio_path
+        except Exception as e:
+            raise Exception(f"提取音频时出错: {str(e)}")
+    # 流式音频
+    def transcode_audio_from_video_url_stream(self, video_url: str) -> Path:
+        """从视频源流式转码为音频文件
+        
+        参数说明:
+        - video_url: 视频播放地址
+        
+        返回值说明:
+        - Path: 生成的音频文件路径
+        
+        异常说明:
+        - Exception: ffmpeg 转码失败
+        """
+        out_path = self.temp_dir / 'stream.mp3'
+        src = self._apply_ratio(video_url)
+        h = f"User-Agent: {HEADERS['User-Agent']}\r\nReferer: https://www.iesdouyin.com/\r\n"
+        try:
+            (
+                ffmpeg
+                .input(src, headers=h)
+                .output(str(out_path), acodec='libmp3lame', audio_bitrate=AUDIO_BITRATE, ar=AUDIO_SAMPLE_RATE, ac=AUDIO_CHANNELS, t=GROQ_STREAM_DURATION_SEC)
+                .run(capture_stdout=True, capture_stderr=True, overwrite_output=True)
+            )
+            size_mb = out_path.stat().st_size / (1024 * 1024)
+            if size_mb > GROQ_MAX_AUDIO_MB and AUDIO_BITRATE_FALLBACK:
+                fallback_path = self.temp_dir / 'stream.fallback.mp3'
+                (
+                    ffmpeg
+                    .input(src, headers=h)
+                    .output(str(fallback_path), acodec='libmp3lame', audio_bitrate=AUDIO_BITRATE_FALLBACK, ar=AUDIO_SAMPLE_RATE, ac=AUDIO_CHANNELS, t=GROQ_STREAM_DURATION_SEC)
+                    .run(capture_stdout=True, capture_stderr=True, overwrite_output=True)
+                )
+                try:
+                    out_path.unlink()
+                except Exception:
+                    pass
+                fallback_path.rename(out_path)
+            return out_path
         except Exception as e:
             raise Exception(f"提取音频时出错: {str(e)}")
     
@@ -222,7 +310,7 @@ class DouyinProcessor:
         try:
             with open(audio_path, "rb") as f:
                 transcription = self.client.audio.transcriptions.create(
-                    file=(audio_path.name, f.read()),
+                    file=f,
                     model=self.model,
                     response_format="json",
                     temperature=0.0
@@ -337,11 +425,18 @@ async def extract_douyin_text(
         video_info = processor.parse_share_url(share_link)
         
         if provider == 'groq':
-            video_path = await processor.download_video(video_info, ctx)
-            audio_path = processor.extract_audio(video_path)
+            if GROQ_USE_STREAM_TRANSCODE:
+                audio_path = processor.transcode_audio_from_video_url_stream(video_info['url'])
+                video_path = None
+            else:
+                video_path = await processor.download_video(video_info, ctx)
+                audio_path = processor.extract_audio(video_path)
             ctx.info("正在从音频中提取文本...")
             text_content = processor.transcribe_audio_with_groq(audio_path)
-            processor.cleanup_files(video_path, audio_path)
+            if video_path:
+                processor.cleanup_files(video_path, audio_path)
+            else:
+                processor.cleanup_files(audio_path)
         else:
             ctx.info("正在从视频中提取文本...")
             text_content = processor.extract_text_from_video_url(video_info['url'])
