@@ -28,6 +28,7 @@ dependencies = [
     "tqdm",
     "dashscope",
     "groq",
+    "fastapi",
 ]
 
 [project.urls]

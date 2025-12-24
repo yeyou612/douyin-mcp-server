@@ -24,6 +24,8 @@ from http import HTTPStatus
 import dashscope
 from groq import Groq
 import inspect
+from fastapi import FastAPI, Header
+import uvicorn
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp import Context
@@ -31,7 +33,7 @@ from mcp.server.fastmcp import Context
 
 # 创建 MCP 服务器实例
 mcp = FastMCP("Douyin MCP Server", 
-              dependencies=["requests", "ffmpeg-python", "tqdm", "dashscope", "groq"])
+              dependencies=["requests", "ffmpeg-python", "tqdm", "dashscope", "groq", "fastapi"])
 
 # 请求头，模拟移动端访问
 HEADERS = {
@@ -426,8 +428,64 @@ def douyin_text_extraction_guide() -> str:
 
 
 def main():
-    """启动MCP服务器"""
-    mcp.run()
+    port_env = os.getenv("PORT")
+    enable_http = os.getenv("ENABLE_HTTP", "").lower() in ["1", "true", "yes"]
+    if enable_http or port_env:
+        app = FastAPI()
+
+        class SimpleCtx:
+            async def report_progress(self, done, total):
+                return None
+            def info(self, *a, **k):
+                return None
+            def error(self, *a, **k):
+                return None
+
+        @app.get("/healthz")
+        async def healthz():
+            return {"status": "ok"}
+
+        @app.post("/extract-text")
+        async def http_extract_text(payload: dict, authorization: str | None = Header(default=None)):
+            try:
+                share_link = payload.get("share_link", "")
+                model = payload.get("model")
+                token = None
+                if authorization and authorization.startswith("Bearer "):
+                    token = authorization.split(" ", 1)[1]
+                text = await extract_douyin_text(share_link, model=model, ctx=SimpleCtx(), auth_token=token)
+                return {"status": "success", "text": text}
+            except Exception as e:
+                return {"status": "error", "error": str(e)}
+
+        @app.post("/download-link")
+        async def http_download_link(payload: dict, authorization: str | None = Header(default=None)):
+            try:
+                share_link = payload.get("share_link", "")
+                token = None
+                if authorization and authorization.startswith("Bearer "):
+                    token = authorization.split(" ", 1)[1]
+                result = get_douyin_download_link(share_link, auth_token=token)
+                return {"status": "success", "data": json.loads(result)}
+            except Exception as e:
+                return {"status": "error", "error": str(e)}
+
+        @app.post("/video-info")
+        async def http_video_info(payload: dict, authorization: str | None = Header(default=None)):
+            try:
+                share_link = payload.get("share_link", "")
+                token = None
+                if authorization and authorization.startswith("Bearer "):
+                    token = authorization.split(" ", 1)[1]
+                result = parse_douyin_video_info(share_link, auth_token=token)
+                return {"status": "success", "data": json.loads(result)}
+            except Exception as e:
+                return {"status": "error", "error": str(e)}
+
+        port = int(port_env or "8080")
+        uvicorn.run(app, host="0.0.0.0", port=port)
+    else:
+        mcp.run()
 
 
 if __name__ == "__main__":
