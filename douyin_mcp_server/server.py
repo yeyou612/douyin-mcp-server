@@ -22,6 +22,8 @@ from tqdm.asyncio import tqdm
 from urllib import request
 from http import HTTPStatus
 import dashscope
+from groq import Groq
+import inspect
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp import Context
@@ -29,7 +31,7 @@ from mcp.server.fastmcp import Context
 
 # 创建 MCP 服务器实例
 mcp = FastMCP("Douyin MCP Server", 
-              dependencies=["requests", "ffmpeg-python", "tqdm", "dashscope"])
+              dependencies=["requests", "ffmpeg-python", "tqdm", "dashscope", "groq"])
 
 # 请求头，模拟移动端访问
 HEADERS = {
@@ -37,18 +39,47 @@ HEADERS = {
 }
 
 # 默认 API 配置
-DEFAULT_MODEL = "paraformer-v2"
+STT_PROVIDER = os.getenv('STT_PROVIDER', 'dashscope')
+DEFAULT_GROQ_MODEL = os.getenv('GROQ_STT_MODEL', 'whisper-large-v3-turbo')
+DEFAULT_DASHSCOPE_MODEL = os.getenv('DASHSCOPE_STT_MODEL', 'paraformer-v2')
+
+def require_auth(func):
+    expected = os.getenv('MCP_AUTH_TOKEN')
+    if inspect.iscoroutinefunction(func):
+        async def async_wrapper(*args, **kwargs):
+            if expected:
+                token = kwargs.get('auth_token')
+                if token != expected:
+                    raise Exception("鉴权失败: 提供的令牌无效")
+            return await func(*args, **kwargs)
+        return async_wrapper
+    else:
+        def sync_wrapper(*args, **kwargs):
+            if expected:
+                token = kwargs.get('auth_token')
+                if token != expected:
+                    raise Exception("鉴权失败: 提供的令牌无效")
+            return func(*args, **kwargs)
+        return sync_wrapper
 
 
 class DouyinProcessor:
     """抖音视频处理器"""
     
-    def __init__(self, api_key: str, model: Optional[str] = None):
+    def __init__(self, api_key: str, model: Optional[str] = None, provider: Optional[str] = None):
+        self.provider = (provider or STT_PROVIDER).lower()
         self.api_key = api_key
-        self.model = model or DEFAULT_MODEL
+        if self.provider == 'groq':
+            self.model = model or DEFAULT_GROQ_MODEL
+        elif self.provider == 'dashscope':
+            self.model = model or DEFAULT_DASHSCOPE_MODEL
+        else:
+            raise ValueError("无效的转写提供商，请设置 STT_PROVIDER 为 'dashscope' 或 'groq'")
         self.temp_dir = Path(tempfile.mkdtemp())
-        # 设置阿里云百炼API密钥
-        dashscope.api_key = api_key
+        if self.provider == 'groq':
+            self.client = Groq(api_key=api_key)
+        else:
+            dashscope.api_key = api_key
     
     def __del__(self):
         """清理临时目录"""
@@ -150,41 +181,43 @@ class DouyinProcessor:
         except Exception as e:
             raise Exception(f"提取音频时出错: {str(e)}")
     
-    def extract_text_from_video_url(self, video_url: str) -> str:
-        """从视频URL中提取文字（使用阿里云百炼API）"""
+    def transcribe_audio_with_groq(self, audio_path: Path) -> str:
         try:
-            # 发起异步转录任务
+            with open(audio_path, "rb") as f:
+                transcription = self.client.audio.transcriptions.create(
+                    file=(audio_path.name, f.read()),
+                    model=self.model,
+                    response_format="json",
+                    temperature=0.0
+                )
+            text = getattr(transcription, "text", None) or ""
+            return text if text else "未识别到文本内容"
+        except Exception as e:
+            raise Exception(f"提取文字时出错: {str(e)}")
+    
+    def extract_text_from_video_url(self, video_url: str) -> str:
+        try:
             task_response = dashscope.audio.asr.Transcription.async_call(
                 model=self.model,
                 file_urls=[video_url],
                 language_hints=['zh', 'en']
             )
-            
-            # 等待转录完成
             transcription_response = dashscope.audio.asr.Transcription.wait(
                 task=task_response.output.task_id
             )
-            
             if transcription_response.status_code == HTTPStatus.OK:
-                # 获取转录结果
                 for transcription in transcription_response.output['results']:
                     url = transcription['transcription_url']
                     result = json.loads(request.urlopen(url).read().decode('utf8'))
-                    
-                    # 保存结果到临时文件
                     temp_json_path = self.temp_dir / 'transcription.json'
                     with open(temp_json_path, 'w') as f:
                         json.dump(result, f, indent=4, ensure_ascii=False)
-                    
-                    # 提取文本内容
                     if 'transcripts' in result and len(result['transcripts']) > 0:
                         return result['transcripts'][0]['text']
                     else:
                         return "未识别到文本内容"
-                        
             else:
                 raise Exception(f"转录失败: {transcription_response.output.message}")
-                
         except Exception as e:
             raise Exception(f"提取文字时出错: {str(e)}")
     
@@ -196,7 +229,8 @@ class DouyinProcessor:
 
 
 @mcp.tool()
-def get_douyin_download_link(share_link: str) -> str:
+@require_auth
+def get_douyin_download_link(share_link: str, auth_token: Optional[str] = None) -> str:
     """
     获取抖音视频的无水印下载链接
     
@@ -227,38 +261,53 @@ def get_douyin_download_link(share_link: str) -> str:
 
 
 @mcp.tool()
+@require_auth
 async def extract_douyin_text(
     share_link: str,
     model: Optional[str] = None,
-    ctx: Context = None
+    ctx: Context = None,
+    auth_token: Optional[str] = None
 ) -> str:
     """
     从抖音分享链接提取视频中的文本内容
     
     参数:
     - share_link: 抖音分享链接或包含链接的文本
-    - model: 语音识别模型（可选，默认使用paraformer-v2）
+    - model: 语音识别模型（可选，默认根据 STT_PROVIDER 选择）
     
     返回:
     - 提取的文本内容
     
-    注意: 需要设置环境变量 DASHSCOPE_API_KEY
+    注意: 通过环境变量 STT_PROVIDER 选择 'dashscope' 或 'groq'。分别需要：
+    - 当为 dashscope 时：DASHSCOPE_API_KEY（可选模型 DASHSCOPE_STT_MODEL，默认 paraformer-v2）
+    - 当为 groq 时：GROQ_API_KEY（可选模型 GROQ_STT_MODEL，默认 whisper-large-v3-turbo）
     """
     try:
-        # 从环境变量获取API密钥
-        api_key = os.getenv('DASHSCOPE_API_KEY')
-        if not api_key:
-            raise ValueError("未设置环境变量 DASHSCOPE_API_KEY，请在配置中添加阿里云百炼API密钥")
-        
-        processor = DouyinProcessor(api_key, model)
+        provider = os.getenv('STT_PROVIDER', 'dashscope').lower()
+        if provider == 'groq':
+            api_key = os.getenv('GROQ_API_KEY')
+            if not api_key:
+                raise ValueError("未设置环境变量 GROQ_API_KEY，请在配置中添加 Groq API 密钥")
+            processor = DouyinProcessor(api_key, model, provider='groq')
+        else:
+            api_key = os.getenv('DASHSCOPE_API_KEY')
+            if not api_key:
+                raise ValueError("未设置环境变量 DASHSCOPE_API_KEY，请在配置中添加阿里云百炼API密钥")
+            processor = DouyinProcessor(api_key, model, provider='dashscope')
         
         # 解析视频链接
         ctx.info("正在解析抖音分享链接...")
         video_info = processor.parse_share_url(share_link)
         
-        # 直接使用视频URL进行文本提取
-        ctx.info("正在从视频中提取文本...")
-        text_content = processor.extract_text_from_video_url(video_info['url'])
+        if provider == 'groq':
+            video_path = await processor.download_video(video_info, ctx)
+            audio_path = processor.extract_audio(video_path)
+            ctx.info("正在从音频中提取文本...")
+            text_content = processor.transcribe_audio_with_groq(audio_path)
+            processor.cleanup_files(video_path, audio_path)
+        else:
+            ctx.info("正在从视频中提取文本...")
+            text_content = processor.extract_text_from_video_url(video_info['url'])
         
         ctx.info("文本提取完成!")
         return text_content
@@ -269,7 +318,8 @@ async def extract_douyin_text(
 
 
 @mcp.tool()
-def parse_douyin_video_info(share_link: str) -> str:
+@require_auth
+def parse_douyin_video_info(share_link: str, auth_token: Optional[str] = None) -> str:
     """
     解析抖音分享链接，获取视频基本信息
     
@@ -328,17 +378,26 @@ def douyin_text_extraction_guide() -> str:
 
 ## 环境变量配置
 请确保设置了以下环境变量：
-- `DASHSCOPE_API_KEY`: 阿里云百炼API密钥
+- `STT_PROVIDER`: 选择 'dashscope' 或 'groq'（默认 'dashscope'）
+- 当为 dashscope：
+  - `DASHSCOPE_API_KEY`: 阿里云百炼 API 密钥
+  - `DASHSCOPE_STT_MODEL`（可选，默认 `paraformer-v2`）
+- 当为 groq：
+  - `GROQ_API_KEY`: Groq API 密钥
+  - `GROQ_STT_MODEL`（可选，默认 `whisper-large-v3-turbo`）
+- 鉴权：
+  - `MCP_AUTH_TOKEN`: 可选的服务访问令牌；若设置，调用工具时需提供匹配的 `auth_token` 参数
 
 ## 使用步骤
 1. 复制抖音视频的分享链接
-2. 在Claude Desktop配置中设置环境变量 DASHSCOPE_API_KEY
+2. 在Claude Desktop配置中设置 `STT_PROVIDER` 以及相应提供商的 API 密钥
 3. 使用相应的工具进行操作
+4. 如开启鉴权，调用工具需提供 `auth_token` 参数
 
 ## 工具说明
-- `extract_douyin_text`: 完整的文本提取流程（需要API密钥）
-- `get_douyin_download_link`: 获取无水印视频下载链接（无需API密钥）
-- `parse_douyin_video_info`: 仅解析视频基本信息
+- `extract_douyin_text`: 完整的文本提取流程（需要API密钥，若设置鉴权需提供auth_token）
+- `get_douyin_download_link`: 获取无水印视频下载链接（无需API密钥，若设置鉴权需提供auth_token）
+- `parse_douyin_video_info`: 仅解析视频基本信息（若设置鉴权需提供auth_token）
 - `douyin://video/{video_id}`: 获取指定视频的详细信息
 
 ## Claude Desktop 配置示例
@@ -349,7 +408,8 @@ def douyin_text_extraction_guide() -> str:
       "command": "uvx",
       "args": ["douyin-mcp-server"],
       "env": {
-        "DASHSCOPE_API_KEY": "your-dashscope-api-key-here"
+        "STT_PROVIDER": "groq",
+        "GROQ_API_KEY": "your-groq-api-key-here"
       }
     }
   }
@@ -357,10 +417,11 @@ def douyin_text_extraction_guide() -> str:
 ```
 
 ## 注意事项
-- 需要提供有效的阿里云百炼API密钥（通过环境变量）
-- 使用阿里云百炼的paraformer-v2模型进行语音识别
+- 需要提供有效的 Groq API 密钥（通过环境变量）
+- 使用 Groq 的 whisper-large-v3-turbo 或百炼的 paraformer-v2 进行语音识别（分别可通过环境变量配置）
 - 支持大部分抖音视频格式
 - 获取下载链接无需API密钥
+ - 若设置了 `MCP_AUTH_TOKEN`，所有工具调用需提供匹配的 `auth_token` 参数
 """
 
 

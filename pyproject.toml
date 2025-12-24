@@ -27,6 +27,7 @@ dependencies = [
     "ffmpeg-python",
     "tqdm",
     "dashscope",
+    "groq",
 ]
 
 [project.urls]
