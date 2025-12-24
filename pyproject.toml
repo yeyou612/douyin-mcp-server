@@ -29,6 +29,7 @@ dependencies = [
     "dashscope",
     "groq",
     "fastapi",
+    "uvicorn",
 ]
 
 [project.urls]

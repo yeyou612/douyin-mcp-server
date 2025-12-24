@@ -24,8 +24,10 @@ from http import HTTPStatus
 import dashscope
 from groq import Groq
 import inspect
+
 from fastapi import FastAPI, Header
 import uvicorn
+import shutil
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp import Context
@@ -64,6 +66,39 @@ def require_auth(func):
             return func(*args, **kwargs)
         return sync_wrapper
 
+
+# 健康状态
+def get_health_status() -> dict:
+    """
+    获取服务健康状态
+    
+    参数说明:
+    - 无
+    
+    返回值说明:
+    - dict: 包含服务配置、依赖可用性等状态信息
+    
+    异常说明:
+    - 无
+    """
+    provider = os.getenv('STT_PROVIDER', 'dashscope').lower()
+    groq_key = bool(os.getenv('GROQ_API_KEY'))
+    dashscope_key = bool(os.getenv('DASHSCOPE_API_KEY'))
+    auth_required = bool(os.getenv('MCP_AUTH_TOKEN'))
+    http_enabled = os.getenv("ENABLE_HTTP", "").lower() in ["1", "true", "yes"] or bool(os.getenv("PORT"))
+    ffmpeg_path = shutil.which("ffmpeg")
+    return {
+        "status": "ok",
+        "provider": provider,
+        "keys": {
+            "groq": groq_key,
+            "dashscope": dashscope_key
+        },
+        "auth_required": auth_required,
+        "http_enabled": http_enabled,
+        "ffmpeg": bool(ffmpeg_path),
+        "ffmpeg_path": ffmpeg_path or ""
+    }
 
 class DouyinProcessor:
     """抖音视频处理器"""
@@ -443,7 +478,7 @@ def main():
 
         @app.get("/healthz")
         async def healthz():
-            return {"status": "ok"}
+            return get_health_status()
 
         @app.post("/extract-text")
         async def http_extract_text(payload: dict, authorization: str | None = Header(default=None)):

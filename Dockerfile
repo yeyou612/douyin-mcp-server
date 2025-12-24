@@ -5,4 +5,5 @@ RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY . /app
 RUN pip install --no-cache-dir --upgrade pip && pip install --no-cache-dir .
+EXPOSE 8080
 CMD ["python", "-m", "douyin_mcp_server.server"]
