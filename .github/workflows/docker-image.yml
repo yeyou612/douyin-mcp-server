@@ -47,6 +47,7 @@ jobs:
             type=ref,event=branch
             type=ref,event=tag
             type=sha
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
       
       - name: Extract Docker metadata (Docker Hub)
         if: ${{ secrets.DOCKERHUB_USERNAME != '' && secrets.DOCKERHUB_TOKEN != '' }}
@@ -58,6 +59,7 @@ jobs:
             type=ref,event=branch
             type=ref,event=tag
             type=sha
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
 
       - name: Build and push
         uses: docker/build-push-action@v6
